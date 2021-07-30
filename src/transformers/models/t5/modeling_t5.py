@@ -95,6 +95,7 @@ def load_tf_weights_in_t5(model, config, tf_checkpoint_path):
         names.append(name)
         tf_weights[name] = array
 
+    var_map = {"variables_map": {}, "transposed_tensors": []}
     for txt_name in names:
         name = txt_name.split("/")
         # adam_v and adam_m are variables used in AdamWeightDecayOptimizer to calculated m and v
@@ -112,6 +113,7 @@ def load_tf_weights_in_t5(model, config, tf_checkpoint_path):
             continue
         pointer = model
         array = tf_weights[txt_name]
+        name_stack = []
 
         for m_name in name:
             if re.fullmatch(r"[A-Za-z]+_\d+", m_name):
@@ -120,47 +122,69 @@ def load_tf_weights_in_t5(model, config, tf_checkpoint_path):
                 scope_names = [m_name]
             if scope_names[0] in ["kernel", "scale", "embedding"]:
                 pointer = getattr(pointer, "weight")
+                name_stack.append("weight")
             elif scope_names[0] == "self_attention":
                 pointer = getattr(pointer, "layer")
                 pointer = pointer[0]
+                name_stack.append("layer")
             elif scope_names[0] == "enc_dec_attention":
                 pointer = getattr(pointer, "layer")
                 pointer = pointer[1]
+                name_stack.append("layer")
             elif scope_names[0] == "dense_relu_dense":
                 pointer = getattr(pointer, "layer")
                 pointer = pointer[2]
+                name_stack.append("layer")
             elif scope_names[0] == "rms_norm":
                 if hasattr(pointer, "layer_norm"):
                     pointer = getattr(pointer, "layer_norm")
+                    name_stack.append("layer_norm")
                 elif hasattr(pointer, "final_layer_norm"):
                     pointer = getattr(pointer, "final_layer_norm")
+                    name_stack.append("final_layer_norm")
             elif scope_names[0] == "scale":
                 pointer = getattr(pointer, "weight")
+                name_stack.append("weight")
             elif scope_names[0] == "output_bias" or scope_names[0] == "beta":
                 pointer = getattr(pointer, "bias")
+                name_stack.append("bias")
             elif scope_names[0] == "squad":
                 pointer = getattr(pointer, "classifier")
+                name_stack.append("classifier")
             elif scope_names[0] == "decoder" and name[1] == "logits":
                 continue
             elif scope_names[0] == "logits":
                 pointer = getattr(pointer, "lm_head")
+                name_stack.append("lm_head")
             elif scope_names[0] == "wi" and len(scope_names) > 1 and scope_names[1].isdigit():
                 pointer = getattr(pointer, f"wi_{scope_names[1]}")
+                name_stack.append(f"wi_{scope_names[1]}")
                 continue
             else:
                 try:
                     pointer = getattr(pointer, scope_names[0])
+                    name_stack.append(scope_names[0])
                 except AttributeError:
                     logger.info(f"Skipping {'/'.join(name)}")
                     continue
             if len(scope_names) >= 2:
                 num = int(scope_names[1])
                 pointer = pointer[num]
+                name_stack.append(str(num))
+
         if scope_names[0] not in ["kernel", "scale", "embedding"]:
             pointer = getattr(pointer, "weight")
+            name_stack.append("weight")
+
+        pytorch_variable_name = ".".join(name_stack)
+        assert pytorch_variable_name in model.state_dict()
+        tf_variable_name = "/".join(name)
+        var_map["variables_map"][pytorch_variable_name] = tf_variable_name
+
         if scope_names[0] != "embedding":
             logger.info(f"Transposing numpy weight of shape {array.shape} for {name}")
             array = np.transpose(array)
+            var_map["transposed_tensors"].append(pytorch_variable_name)
         try:
             assert (
                 pointer.shape == array.shape
@@ -168,12 +192,17 @@ def load_tf_weights_in_t5(model, config, tf_checkpoint_path):
         except AssertionError as e:
             e.args += (pointer.shape, array.shape)
             raise
+
         logger.info(f"Initialize PyTorch weight {name}")
         pointer.data = torch.from_numpy(array.astype(np.float32))
         tf_weights.pop(txt_name, None)
 
-    logger.info(f"Weights not copied to PyTorch model: {', '.join(tf_weights.keys())}.")
-    return model
+    logger.info("weights with no mapping:")
+    for k in model.state_dict():
+        if k not in var_map["variables_map"] and k not in tf_weights:
+            logger.info(k)
+    logger.info("Weights not copied to PyTorch model: {}".format(", ".join(tf_weights.keys())))
+    return model, var_map
 
 
 ####################################################
@@ -393,15 +422,18 @@ class T5Attention(nn.Module):
 
     def compute_bias(self, query_length, key_length):
         """Compute binned relative position bias"""
-        context_position = torch.arange(query_length, dtype=torch.long)[:, None]
-        memory_position = torch.arange(key_length, dtype=torch.long)[None, :]
+        context_position = torch.arange(
+            query_length, dtype=torch.long, device=self.relative_attention_bias.weight.device
+        )[:, None]
+        memory_position = torch.arange(
+            key_length, dtype=torch.long, device=self.relative_attention_bias.weight.device
+        )[None, :]
         relative_position = memory_position - context_position  # shape (query_length, key_length)
         relative_position_bucket = self._relative_position_bucket(
             relative_position,  # shape (query_length, key_length)
             bidirectional=(not self.is_decoder),
             num_buckets=self.relative_attention_num_buckets,
         )
-        relative_position_bucket = relative_position_bucket.to(self.relative_attention_bias.weight.device)
         values = self.relative_attention_bias(relative_position_bucket)  # shape (query_length, key_length, num_heads)
         values = values.permute([2, 0, 1]).unsqueeze(0)  # shape (1, num_heads, query_length, key_length)
         return values
