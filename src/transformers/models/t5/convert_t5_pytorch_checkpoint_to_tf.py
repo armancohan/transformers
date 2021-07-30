@@ -6,7 +6,6 @@ import os
 
 import numpy as np
 import tensorflow as tf
-import torch
 
 from transformers import T5Model
 
