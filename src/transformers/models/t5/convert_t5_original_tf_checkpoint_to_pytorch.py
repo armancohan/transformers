@@ -16,6 +16,7 @@
 
 
 import argparse
+import json
 
 from transformers import T5Config, T5ForConditionalGeneration, load_tf_weights_in_t5
 from transformers.utils import logging
@@ -31,11 +32,15 @@ def convert_tf_checkpoint_to_pytorch(tf_checkpoint_path, config_file, pytorch_du
     model = T5ForConditionalGeneration(config)
 
     # Load weights from tf checkpoint
-    load_tf_weights_in_t5(model, config, tf_checkpoint_path)
+    _, var_map = load_tf_weights_in_t5(model, config, tf_checkpoint_path)
 
     # Save pytorch-model
     print(f"Save PyTorch model to {pytorch_dump_path}")
     model.save_pretrained(pytorch_dump_path)
+
+    print(f"Save mappings of variable names from pytorch to tensorflow to: {pytorch_dump_path}")
+    with open(pytorch_dump_path + "/variable_maps.json", "w") as f_out:
+        json.dump(var_map, f_out, indent=2)
 
 
 if __name__ == "__main__":
